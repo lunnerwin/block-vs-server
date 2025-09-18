@@ -15,13 +15,9 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 
 // --- In-memory Data Store ---
-// NOTE: In a production environment, you might want to use Redis or another persistent store.
-// For Render's free tier, in-memory is fine as the server restarts.
 const players = {}; // key: nickname, value: player data
 const socketIdToNickname = {}; // key: socket.id, value: nickname
 const pendingRequests = {}; // Stores pending battle requests
-
-// --- Auto-matchmaking Queue ---
 const autoMatchQueue = new Set();
 
 
@@ -34,7 +30,6 @@ io.on('connection', (socket) => {
     const { nickname } = data;
     if (!nickname) return;
 
-    // Handle duplicate connections
     if (players[nickname] && players[nickname].socketId !== socket.id) {
       const oldSocketId = players[nickname].socketId;
       console.log(`[Duplicate] Disconnecting old session for ${nickname}`);
@@ -44,7 +39,7 @@ io.on('connection', (socket) => {
     
     socketIdToNickname[socket.id] = nickname;
     players[nickname] = {
-      ...(players[nickname] || {}), // Preserve old data if exists
+      ...(players[nickname] || {}), 
       socketId: socket.id,
       nickname: nickname,
       isAway: false,
@@ -67,7 +62,11 @@ io.on('connection', (socket) => {
         isAway: false,
     };
     console.log(`[Lobby] ${nickname} entered.`);
-    broadcastLobbyUpdate();
+    
+    // 🔥 [버그 수정] 새로운 유저에게 먼저 로비 정보를 보낸 후, 다른 사람들에게 브로드캐스트합니다.
+    const lobbyPlayers = getLobbyPlayersList();
+    socket.emit('lobby_update', { event: 'lobby_update', data: lobbyPlayers }); // 나에게 먼저 전송
+    socket.broadcast.to('lobby').emit('lobby_update', { event: 'lobby_update', data: lobbyPlayers }); // 다른 사람들에게 전송
   });
   
   socket.on('leaveLobby', () => {
@@ -75,7 +74,6 @@ io.on('connection', (socket) => {
      if (players[nickname]) {
          socket.leave('lobby');
          console.log(`[Lobby] ${nickname} left.`);
-         // Don't delete player data, just update status
          players[nickname].isReady = false;
          players[nickname].isAutoReady = false;
          broadcastLobbyUpdate();
@@ -137,7 +135,6 @@ io.on('connection', (socket) => {
         type: data.type
     };
     
-    // Send request to the target player
     io.to(target.socketId).emit('incoming_request', { event: 'incoming_request', data: { from: requesterNick, type: data.type, requestId: requestId }});
   });
 
@@ -149,7 +146,6 @@ io.on('connection', (socket) => {
     if (!requester) return;
 
     if (data.accepted) {
-        // Notify requester that opponent accepted, waiting for final confirmation
         io.to(requester.socketId).emit('opponent_accepted', { event: 'opponent_accepted', data: { from: responderNick, type: 'manual' }});
     } else {
         io.to(requester.socketId).emit('opponent_declined', { event: 'opponent_declined', data: { from: responderNick, type: 'manual' }});
@@ -176,7 +172,6 @@ io.on('connection', (socket) => {
     console.log(`[Disconnection] User disconnected: ${socket.id}`);
     const nickname = socketIdToNickname[socket.id];
     if (nickname) {
-        // Clean up any pending requests involving this user
         Object.keys(pendingRequests).forEach(id => {
             const request = pendingRequests[id];
             if (request.from === nickname || request.to === nickname) {
@@ -201,16 +196,14 @@ io.on('connection', (socket) => {
 // === HTTP API Endpoints ===
 app.use(express.json());
 
-// Simple health check
 app.get('/', (req, res) => {
   res.send({ status: 'Server is running', playerCount: Object.keys(players).length });
 });
 
-// Get user stats (replace with your actual database call)
 app.get('/stats/:nickname', (req, res) => {
     const { nickname } = req.params;
-    // This is a mock. You should fetch this data from your Firestore/DB.
     console.log(`[API] Stats requested for ${nickname}`);
+    // This is a mock response. In a real app, you would fetch this from a database.
     res.status(200).send({
         bestPlayedRecords: {
             block_w_stage: {
@@ -224,11 +217,15 @@ app.get('/stats/:nickname', (req, res) => {
 
 // === Helper Functions ===
 
-function broadcastLobbyUpdate() {
-  const lobbyPlayers = Object.values(players)
-    .filter(p => p.socketId && io.sockets.sockets.get(p.socketId)) // Ensure player is connected
-    .map(({ socketId, ...rest }) => rest); // Don't send socketId to clients
+function getLobbyPlayersList() {
+    // Return only players who are currently connected
+    return Object.values(players)
+      .filter(p => p.socketId && io.sockets.sockets.get(p.socketId)) 
+      .map(({ socketId, ...rest }) => rest); // Exclude socketId from the data sent to clients
+}
 
+function broadcastLobbyUpdate() {
+  const lobbyPlayers = getLobbyPlayersList();
   io.to('lobby').emit('lobby_update', { event: 'lobby_update', data: lobbyPlayers });
 }
 
@@ -257,7 +254,6 @@ function startBattle(player1Nick, player2Nick) {
 
     io.to(player1.socketId).to(player2.socketId).emit('match_found', matchData);
     
-    // Update lobby for everyone else
     broadcastLobbyUpdate();
 }
 
@@ -266,11 +262,16 @@ function processAutoMatchQueue() {
         const playersToMatch = Array.from(autoMatchQueue).slice(0, 2);
         const [player1Nick, player2Nick] = playersToMatch;
 
-        // Remove from queue
-        autoMatchQueue.delete(player1Nick);
-        autoMatchQueue.delete(player2Nick);
-
-        startBattle(player1Nick, player2Nick);
+        // Ensure players still exist and are available
+        if (players[player1Nick] && players[player2Nick]) {
+            autoMatchQueue.delete(player1Nick);
+            autoMatchQueue.delete(player2Nick);
+            startBattle(player1Nick, player2Nick);
+        } else {
+            // One of the players might have disconnected, remove them from queue
+            if (!players[player1Nick]) autoMatchQueue.delete(player1Nick);
+            if (!players[player2Nick]) autoMatchQueue.delete(player2Nick);
+        }
     }
 }
 
@@ -278,3 +279,4 @@ function processAutoMatchQueue() {
 server.listen(PORT, () => {
   console.log(`✅ Server is running on http://localhost:${PORT}`);
 });
+
