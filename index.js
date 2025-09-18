@@ -2,7 +2,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const { v4: uuidv4 } = require('uuid'); // 고유 ID 생성을 위한 라이브_러리
+const { v4: uuidv4 } = require('uuid'); // 고유 ID 생성을 위한 라이브러리
 
 // 서버의 기본 설정을 합니다.
 const app = express();
@@ -31,50 +31,46 @@ const gameRooms = {};
 
 // --- 클라이언트가 접속했을 때 처리할 로직 ---
 io.on('connection', (socket) => {
-  console.log(`[Connection] New client connected: ${socket.id}`);
+  console.log(`[Connection] A user connected: ${socket.id}`);
 
-  // 클라이언트가 자신의 닉네임을 등록 (기존 앱의 비밀번호 인증은 생략)
+  // --- 1. 로그인 및 중복 접속 처리 ---
   socket.on('register', (nickname) => {
-    if (!nickname) return;
-
-    // 다른 소켓에서 이미 사용 중인 닉네임인 경우 (중복 로그인 처리)
-    if (players[nickname] && players[nickname].socketId && players[nickname].socketId !== socket.id) {
-      const oldSocketId = players[nickname].socketId;
-      console.log(`[Login] Duplicate login for ${nickname}. Disconnecting old session: ${oldSocketId}`);
-      io.to(oldSocketId).emit('force_logout'); // 기존 클라이언트에게 접속 해제 신호 전송
+    if (players[nickname] && players[nickname].socketId !== socket.id) {
+        // 이미 다른 소켓으로 접속 중인 유저가 있다면, 이전 소켓의 연결을 끊습니다.
+        console.log(`[Duplicate Login] ${nickname} logged in from a new device. Disconnecting old session.`);
+        const oldSocketId = players[nickname].socketId;
+        io.to(oldSocketId).emit('force_logout');
+        io.sockets.sockets.get(oldSocketId)?.disconnect();
     }
-
-    console.log(`[Register] Client ${socket.id} is registered as ${nickname}`);
     socketIdToNickname[socket.id] = nickname;
-    players[nickname] = { ...(players[nickname] || {}), socketId: socket.id }; // 기존 정보가 있다면 유지하고 socketId만 갱신
+    players[nickname] = { ...players[nickname], socketId: socket.id, nickname: nickname };
+    console.log(`[Register] User '${nickname}' registered with socket ID ${socket.id}`);
   });
 
-  // --- 대기실(Lobby) 관련 로직 ---
-  socket.on('enterLobby', (playerInfo) => {
-    const nickname = playerInfo.nickname;
-    if (!nickname || !players[nickname]) return;
 
-    console.log(`[Lobby Enter] ${nickname}(${socket.id}) entered with info:`, playerInfo);
+  // --- 2. 로비(대기실) 관련 로직 ---
+  socket.on('enterLobby', (playerData) => {
+    const nickname = socketIdToNickname[socket.id];
+    if (!nickname) return;
+
+    socket.join('lobby'); // 'lobby'라는 채널(방)에 참여시킵니다.
     players[nickname] = {
-      ...playerInfo,
-      socketId: socket.id,
-      inBattle: false,
+        ...players[nickname],
+        country: playerData.country,
+        advenLv: playerData.advenLv,
+        isReady: playerData.isReady,
+        isAutoReady: playerData.isAutoReady,
+        inBattle: false, // 로비에 들어오면 항상 false로 초기화
     };
-    socket.join('lobby'); // 모든 로비 유저를 'lobby' 룸에 참가시킴
+    console.log(`[Enter Lobby] ${nickname} entered the lobby.`);
     broadcastLobbyUpdate();
   });
 
   socket.on('leaveLobby', () => {
-    // 게임방으로 이동하기 직전에 클라이언트가 호출. 로비 업데이트에서 제외됨.
-    const nickname = socketIdToNickname[socket.id];
-    if (nickname) {
-        socket.leave('lobby');
-        console.log(`[Lobby Leave] ${nickname} left the lobby to join a game.`);
-    }
+    socket.leave('lobby');
+    console.log(`[Leave Lobby] ${socketIdToNickname[socket.id]} left the lobby for a match.`);
   });
 
-
-  // --- 준비 상태 변경 ---
   socket.on('toggleReady', (isReady) => {
     const nickname = socketIdToNickname[socket.id];
     if (players[nickname]) {
@@ -91,216 +87,164 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- 대결 신청 (수동/자동) ---
-  const handleRequest = (requesterNickname, targetNickname, isAutoMatch) => {
-    if (!requesterNickname || !targetNickname || !players[requesterNickname] || !players[targetNickname]) {
-      return;
-    }
-    if (players[targetNickname].inBattle) {
-       socket.emit('requestFailed', { reason: `${targetNickname} is already in a match.` });
-       return;
-    }
 
-    const targetSocketId = players[targetNickname].socketId;
-    const requestType = isAutoMatch ? 'incomingAutoMatchRequest' : 'incomingManualRequest';
-
-    console.log(`[Request][${isAutoMatch ? 'Auto' : 'Manual'}] ${requesterNickname} -> ${targetNickname}`);
-    io.to(targetSocketId).emit(requestType, {
-      fromNickname: requesterNickname,
-    });
-  };
-  
-  // 수동 신청
+  // --- 3. 매치메이킹 관련 로직 ---
   socket.on('sendManualRequest', (data) => {
-    const requesterNickname = socketIdToNickname[socket.id];
-    handleRequest(requesterNickname, data.opponentNickname, false);
+    handleRequest(socket, data.opponentNickname, false);
   });
-  
-  // 자동 신청 (클라이언트의 _findAutoMatch 로직에 의해 호출됨)
   socket.on('sendAutoMatchRequest', (data) => {
-    const requesterNickname = socketIdToNickname[socket.id];
-    handleRequest(requesterNickname, data.opponentNickname, true);
+    handleRequest(socket, data.opponentNickname, true);
   });
-  
-  // 대결 신청에 대한 응답
+
   socket.on('respondToRequest', (data) => {
-    const { requesterNickname, accepted, isAutoMatch } = data;
-    const responderNickname = socketIdToNickname[socket.id];
+    const myNickname = socketIdToNickname[socket.id];
+    const requesterNickname = data.requesterNickname;
+    const requester = players[requesterNickname];
+    
+    if (!requester) return;
 
-    if (!players[requesterNickname] || !players[responderNickname]) return;
-
-    const requesterSocketId = players[requesterNickname].socketId;
-
-    if (accepted) {
-      console.log(`[Request] ${responderNickname} accepted request from ${requesterNickname}.`);
-      startBattle(requesterNickname, responderNickname);
+    if (data.accepted) {
+        startBattle(requesterNickname, myNickname);
     } else {
-      console.log(`[Request] ${responderNickname} declined request from ${requesterNickname}.`);
-      const declineEvent = isAutoMatch ? 'autoMatchRequestDeclined' : 'manualRequestDeclined';
-      io.to(requesterSocketId).emit(declineEvent, { fromNickname: responderNickname });
+        const eventName = data.isAutoMatch ? 'autoMatchRequestDeclined' : 'manualRequestDeclined';
+        io.to(requester.socketId).emit(eventName, { fromNickname: myNickname });
     }
   });
 
-
-  // --- 게임 플레이 중 데이터 중계 로직 ---
+  // --- 4. 게임방(Battle Room) 관련 로직 ---
   socket.on('joinRoom', (battleId) => {
-    if(!battleId) return;
-    socket.join(battleId);
-    const nickname = socketIdToNickname[socket.id];
-    console.log(`[Game Join] ${nickname} joined room: ${battleId}`);
+      socket.join(battleId);
+      console.log(`[Join Room] ${socketIdToNickname[socket.id]} joined battle room: ${battleId}`);
+  });
+  socket.on('leaveRoom', (data) => {
+      const battleId = data.battleId;
+      socket.leave(battleId);
+      console.log(`[Leave Room] ${socketIdToNickname[socket.id]} left battle room: ${battleId}`);
   });
 
   socket.on('playerReadyForStart', (data) => {
-    const { battleId } = data;
-    const room = gameRooms[battleId];
-    const nickname = socketIdToNickname[socket.id];
-    if (!room || !nickname) return;
-
-    room.readyStates[nickname] = true;
-    
-    // 두 명 모두 준비되었는지 확인
-    if (Object.values(room.readyStates).every(state => state === true)) {
-        console.log(`[Game Ready] Both players ready. Starting battle ${battleId}`);
-        io.to(battleId).emit('gameStart');
-    }
+      handlePlayerReady(socket, data.battleId, 'readyStates');
+  });
+  socket.on('playerReadyForRematch', (data) => {
+      handlePlayerReady(socket, data.battleId, 'rematchReadyStates');
   });
 
   socket.on('sendGridData', (data) => {
-    if(!data || !data.battleId || data.gridData === undefined) return;
     socket.to(data.battleId).emit('opponentGridUpdate', data.gridData);
   });
 
   socket.on('sendAttack', (data) => {
-    if(!data || !data.battleId || !data.attackData) return;
     socket.to(data.battleId).emit('incomingAttack', data.attackData);
   });
-  
-  // 패배 선언
-  socket.on('declareDefeat', (data) => {
-    if(!data || !data.battleId) return;
-    const loserNickname = socketIdToNickname[socket.id];
-    const room = gameRooms[data.battleId];
-    if(!room) return;
 
-    const winner = room.players.find(p => p.nickname !== loserNickname);
-    console.log(`[Game Over] ${loserNickname} lost. Winner is ${winner?.nickname}.`);
-    io.to(data.battleId).emit('gameOver', { winner: winner?.nickname, loser: loserNickname });
-  });
-
-  // 자리비움(AFK) 처리
   socket.on('setAwayStatus', (data) => {
-    const { battleId, isAway } = data;
-    socket.to(battleId).emit('opponentAwayStatus', { isAway: isAway });
+    socket.to(data.battleId).emit('opponentAwayStatus', { isAway: data.isAway });
   });
 
-  // KO 발생 (클라이언트가 카운트다운 후 서버에 보고)
   socket.on('reportKO', (data) => {
-      const { battleId, opponentNickname } = data; // KO 당한 상대 닉네임
-      const room = gameRooms[battleId];
-      if (!room) return;
+      const battle = gameRooms[data.battleId];
+      if (!battle) return;
+      
+      const opponentNickname = data.opponentNickname;
+      battle.outCounts[opponentNickname] = (battle.outCounts[opponentNickname] || 0) + 1;
+      
+      const outCounts = battle.outCounts;
+      io.to(data.battleId).emit('updateOutCount', outCounts);
 
-      room.outCounts[opponentNickname]++;
-      console.log(`[KO Report] ${opponentNickname} timed out. Out count: ${room.outCounts[opponentNickname]}`);
-      io.to(battleId).emit('updateOutCount', room.outCounts);
-
-      if (room.outCounts[opponentNickname] >= 3) {
-          const winnerNickname = socketIdToNickname[socket.id];
-          console.log(`[KO Game Over] ${opponentNickname} is KO'd. Winner is ${winnerNickname}.`);
-          io.to(battleId).emit('gameOver', { winner: winnerNickname, loser: opponentNickname, reason: 'KO' });
-          delete gameRooms[battleId];
+      if (outCounts[opponentNickname] >= 3) {
+          io.to(data.battleId).emit('gameOver', { winner: socketIdToNickname[socket.id], reason: 'KO' });
       }
   });
 
+  socket.on('declareDefeat', (data) => {
+    const battle = gameRooms[data.battleId];
+    if (!battle) return;
+    
+    const loser = socketIdToNickname[socket.id];
+    const winner = battle.players.find(p => p.nickname !== loser)?.nickname;
 
-  // --- 재대결 로직 ---
+    io.to(data.battleId).emit('gameOver', { winner: winner, loser: loser, reason: data.hasLeft ? 'left' : 'defeat' });
+  });
+
+  // --- 5. 재대결 로직 ---
   socket.on('requestRematch', (data) => {
-    const { battleId } = data;
-    const room = gameRooms[battleId];
-    const nickname = socketIdToNickname[socket.id];
-    if (!room || !nickname) return;
+      const battle = gameRooms[data.battleId];
+      if (!battle) return;
+      const requester = socketIdToNickname[socket.id];
+      const opponent = battle.players.find(p => p.nickname !== requester);
+      if (opponent) {
+          io.to(opponent.socketId).emit('rematchRequested');
+      }
+  });
 
-    room.rematchState[nickname] = 'requested';
-    console.log(`[Rematch] ${nickname} requested a rematch in room ${battleId}.`);
-    socket.to(battleId).emit('rematchRequested');
+  socket.on('answerRematch', (data) => {
+      const battle = gameRooms[data.battleId];
+      if (!battle) return;
+      const responder = socketIdToNickname[socket.id];
+      const requester = battle.players.find(p => p.nickname !== responder);
+
+      if (requester) {
+          if (data.accepted) {
+              io.to(requester.socketId).emit('rematchAccepted');
+              // 양쪽 모두 준비 상태를 초기화하고 재대결 시작
+              battle.rematchReadyStates = { [requester.nickname]: false, [responder.nickname]: false };
+              io.to(data.battleId).emit('startRematch');
+          } else {
+              io.to(requester.socketId).emit('rematchDeclined');
+          }
+      }
   });
   
-  socket.on('answerRematch', (data) => {
-      const { battleId, accepted } = data;
-      const nickname = socketIdToNickname[socket.id];
-      const room = gameRooms[battleId];
-      if (!room || !nickname) return;
-      
-      if(accepted){
-          room.rematchState[nickname] = 'accepted';
-          socket.to(battleId).emit('rematchAccepted');
 
-          const allReady = Object.values(room.rematchState).every(state => state === 'requested' || state === 'accepted');
-          if (allReady) {
-              console.log(`[Rematch] Both players agreed. Starting rematch in room ${battleId}.`);
-              
-              // 재대결 상태 초기화
-              Object.keys(room.rematchState).forEach(nick => room.rematchState[nick] = 'none');
-              Object.keys(room.outCounts).forEach(nick => room.outCounts[nick] = 0);
-              Object.keys(room.readyStates).forEach(nick => room.readyStates[nick] = false);
-
-              io.to(battleId).emit('startRematch');
-          }
-      } else {
-          socket.to(battleId).emit('rematchDeclined');
-          // 한 명이라도 거절하면 재대결 상태 초기화
-          Object.keys(room.rematchState).forEach(nick => room.rematchState[nick] = 'none');
-      }
-  });
-
-  socket.on('playerReadyForRematch', (data) => {
-    const { battleId } = data;
-    const room = gameRooms[battleId];
-    const nickname = socketIdToNickname[socket.id];
-    if (!room || !nickname) return;
-
-    room.readyStates[nickname] = true;
-
-    if (Object.values(room.readyStates).every(state => state === true)) {
-        console.log(`[Rematch Ready] Both players ready. Starting rematch battle ${battleId}`);
-        io.to(battleId).emit('gameStart');
-    }
-  });
-
-
-  // --- 접속 해제 처리 ---
+  // --- 6. 연결 끊김 처리 ---
   socket.on('disconnect', () => {
-    const disconnectedNickname = socketIdToNickname[socket.id];
-    console.log(`[Disconnect] Client ${disconnectedNickname}(${socket.id}) disconnected.`);
+    console.log(`[Disconnection] A user disconnected: ${socket.id}`);
+    const nickname = socketIdToNickname[socket.id];
+    if (nickname) {
+        // 게임 중이던 방 찾기
+        const battleId = Object.keys(gameRooms).find(id => gameRooms[id].players.some(p => p.nickname === nickname));
+        if (battleId) {
+            io.to(battleId).emit('opponentLeft');
+            delete gameRooms[battleId];
+        }
 
-    if (disconnectedNickname && players[disconnectedNickname]) {
-      // 게임 중이었는지 확인
-      const battleId = Object.keys(gameRooms).find(id => gameRooms[id].players.some(p => p.nickname === disconnectedNickname));
-      if (battleId) {
-        const room = gameRooms[battleId];
-        console.log(`[Disconnect] ${disconnectedNickname} left match ${battleId}. Notifying opponent.`);
-        socket.to(battleId).emit('opponentLeft');
-        delete gameRooms[battleId];
-      }
-      
-      delete players[disconnectedNickname];
-      delete socketIdToNickname[socket.id];
-      
-      broadcastLobbyUpdate();
+        delete players[nickname];
+        delete socketIdToNickname[socket.id];
+        broadcastLobbyUpdate(); // 로비에 있는 유저들에게 변경사항 알림
     }
   });
 });
 
 // --- 헬퍼 함수들 ---
 
+function handleRequest(socket, opponentNickname, isAutoMatch) {
+  const requesterNickname = socketIdToNickname[socket.id];
+  const opponent = players[opponentNickname];
+  if (!opponent || !requesterNickname) return;
+
+  const eventName = isAutoMatch ? 'incomingAutoMatchRequest' : 'incomingManualRequest';
+  io.to(opponent.socketId).emit(eventName, { fromNickname: requesterNickname });
+}
+
+function handlePlayerReady(socket, battleId, readyStateType) {
+    const battle = gameRooms[battleId];
+    if (!battle) return;
+
+    const nickname = socketIdToNickname[socket.id];
+    if (!battle[readyStateType]) {
+        battle[readyStateType] = {};
+    }
+    battle[readyStateType][nickname] = true;
+
+    const allReady = battle.players.every(p => battle[readyStateType][p.nickname]);
+    if (allReady) {
+        const eventName = readyStateType === 'readyStates' ? 'gameStart' : 'startRematch';
+        io.to(battleId).emit(eventName);
+    }
+}
+
 function broadcastLobbyUpdate() {
-  const lobbyPlayers = Object.values(players).filter(p => p.socketId && !p.inBattle).map(p => ({
-    nickname: p.nickname,
-    country: p.country,
-    advenLv: p.advenLv,
-    isReady: p.isReady,
-    isAutoReady: p.isAutoReady,
-    inBattle: p.inBattle,
-  }));
+  const lobbyPlayers = Object.values(players).filter(p => !p.inBattle && p.socketId);
   io.to('lobby').emit('lobbyUpdate', lobbyPlayers);
   console.log(`[Lobby Update] Broadcasting info of ${lobbyPlayers.length} player(s).`);
 }
