@@ -33,7 +33,7 @@ io.on('connection', (socket) => {
     if (players[nickname] && players[nickname].socketId !== socket.id) {
       const oldSocketId = players[nickname].socketId;
       console.log(`[Duplicate] Disconnecting old session for ${nickname}`);
-      // [수정] 데이터만 전송하도록 변경
+      // Send data directly without wrapping
       io.to(oldSocketId).emit('force_logout', {});
       io.sockets.sockets.get(oldSocketId)?.disconnect();
     }
@@ -65,7 +65,7 @@ io.on('connection', (socket) => {
     console.log(`[Lobby] ${nickname} entered.`);
     
     const lobbyPlayers = getLobbyPlayersList();
-    // [수정] 데이터만 전송하도록 변경
+    // Send data directly without wrapping
     socket.emit('lobby_update', lobbyPlayers);
     socket.broadcast.to('lobby').emit('lobby_update', lobbyPlayers);
   });
@@ -124,7 +124,7 @@ io.on('connection', (socket) => {
     const target = players[targetNick];
 
     if (!requesterNick || !target || target.isAway || target.inBattle) {
-      // [수정] 데이터만 전송하도록 변경
+      // Send data directly without wrapping
       socket.emit('request_cancelled', { from: targetNick });
       return;
     }
@@ -137,7 +137,7 @@ io.on('connection', (socket) => {
         type: data.type
     };
     
-    // [수정] 데이터만 전송하도록 변경
+    // Send data directly without wrapping
     io.to(target.socketId).emit('incoming_request', { from: requesterNick, type: data.type, requestId: requestId });
   });
 
@@ -149,10 +149,10 @@ io.on('connection', (socket) => {
     if (!requester) return;
 
     if (data.accepted) {
-        // [수정] 데이터만 전송하도록 변경
+        // Send data directly without wrapping
         io.to(requester.socketId).emit('opponent_accepted', { from: responderNick, type: 'manual' });
     } else {
-        // [수정] 데이터만 전송하도록 변경
+        // Send data directly without wrapping
         io.to(requester.socketId).emit('opponent_declined', { from: responderNick, type: 'manual' });
     }
   });
@@ -167,7 +167,7 @@ io.on('connection', (socket) => {
       if (data.confirmed) {
           startBattle(requesterNick, responderNick);
       } else {
-          // [수정] 데이터만 전송하도록 변경
+          // Send data directly without wrapping
           io.to(responder.socketId).emit('opponent_declined', { from: requesterNick, type: 'manual' });
       }
   });
@@ -184,7 +184,7 @@ io.on('connection', (socket) => {
                  const otherPlayerNick = request.from === nickname ? request.to : request.from;
                  const otherPlayer = players[otherPlayerNick];
                  if(otherPlayer) {
-                    // [수정] 데이터만 전송하도록 변경
+                    // Send data directly without wrapping
                     io.to(otherPlayer.socketId).emit('request_cancelled', { from: nickname });
                  }
                  delete pendingRequests[id];
@@ -233,7 +233,7 @@ function getLobbyPlayersList() {
 
 function broadcastLobbyUpdate() {
   const lobbyPlayers = getLobbyPlayersList();
-  // [수정] 데이터만 전송하도록 변경
+  // Send data directly without wrapping
   io.to('lobby').emit('lobby_update', lobbyPlayers);
 }
 
@@ -251,7 +251,7 @@ function startBattle(player1Nick, player2Nick) {
 
     console.log(`[Battle] Match found: ${player1Nick} vs ${player2Nick}. ID: ${battleId}`);
     
-    // [수정] 데이터만 전송하도록 변경
+    // Send data directly without wrapping
     const matchData = {
         battleId: battleId,
         player1: player1Nick,
@@ -285,3 +285,4 @@ function processAutoMatchQueue() {
 server.listen(PORT, () => {
   console.log(`✅ Server is running on http://localhost:${PORT}`);
 });
+
