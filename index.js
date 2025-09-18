@@ -17,16 +17,9 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000; // Render가 지정하는 포트 또는 3000번 포트를 사용합니다.
 
 // --- 서버 메모리에 저장될 데이터들 ---
-
-// 1. 플레이어 정보 및 상태 저장소
-// key: 닉네임, value: 플레이어 정보 객체 { socketId, nickname, country, advenLv, isReady, isAutoReady, inBattle }
-const players = {};
-// 2. 소켓 ID와 닉네임을 매핑하는 저장소 (연결 끊김 시 빠른 조회를 위함)
-const socketIdToNickname = {};
-
-// 3. 현재 진행중인 게임방 정보
-// key: battleId, value: { players: [ {nickname, socketId}, ... ], ... }
-const gameRooms = {};
+const players = {}; // key: 닉네임, value: 플레이어 정보 객체
+const socketIdToNickname = {}; // key: 소켓 ID, value: 닉네임
+const gameRooms = {}; // key: battleId, value: 게임방 정보
 
 
 // --- 클라이언트가 접속했을 때 처리할 로직 ---
@@ -36,14 +29,13 @@ io.on('connection', (socket) => {
   // --- 1. 로그인 및 중복 접속 처리 ---
   socket.on('register', (nickname) => {
     if (players[nickname] && players[nickname].socketId !== socket.id) {
-        // 이미 다른 소켓으로 접속 중인 유저가 있다면, 이전 소켓의 연결을 끊습니다.
         console.log(`[Duplicate Login] ${nickname} logged in from a new device. Disconnecting old session.`);
         const oldSocketId = players[nickname].socketId;
         io.to(oldSocketId).emit('force_logout');
         io.sockets.sockets.get(oldSocketId)?.disconnect();
     }
     socketIdToNickname[socket.id] = nickname;
-    players[nickname] = { ...players[nickname], socketId: socket.id, nickname: nickname };
+    players[nickname] = { ...players[nickname], socketId: socket.id, nickname: nickname, isAway: false }; // AFK 상태 초기화
     console.log(`[Register] User '${nickname}' registered with socket ID ${socket.id}`);
   });
 
@@ -53,14 +45,15 @@ io.on('connection', (socket) => {
     const nickname = socketIdToNickname[socket.id];
     if (!nickname) return;
 
-    socket.join('lobby'); // 'lobby'라는 채널(방)에 참여시킵니다.
+    socket.join('lobby');
     players[nickname] = {
         ...players[nickname],
         country: playerData.country,
         advenLv: playerData.advenLv,
         isReady: playerData.isReady,
         isAutoReady: playerData.isAutoReady,
-        inBattle: false, // 로비에 들어오면 항상 false로 초기화
+        inBattle: false,
+        isAway: false, // 로비 진입 시 AFK 상태 해제
     };
     console.log(`[Enter Lobby] ${nickname} entered the lobby.`);
     broadcastLobbyUpdate();
@@ -88,28 +81,73 @@ io.on('connection', (socket) => {
   });
 
 
-  // --- 3. 매치메이킹 관련 로직 ---
-  socket.on('sendManualRequest', (data) => {
-    handleRequest(socket, data.opponentNickname, false);
-  });
-  socket.on('sendAutoMatchRequest', (data) => {
-    handleRequest(socket, data.opponentNickname, true);
-  });
+  // --- 3. 매치메이킹 관련 로직 (Firebase UI/UX 복원을 위해 전면 수정) ---
 
+  // 3-1. (요청자)가 (상대방)에게 대결 신청
+  socket.on('sendManualRequest', (data) => {
+    const requesterNickname = socketIdToNickname[socket.id];
+    const opponentNickname = data.opponentNickname;
+    const opponent = players[opponentNickname];
+
+    if (!requesterNickname || !opponent) return;
+
+    // 상대가 자리에 없거나, 다른 게임 중이면 요청자에게 바로 알림
+    if (opponent.isAway || opponent.inBattle) {
+        socket.emit('opponentIsAfk', { fromNickname: opponentNickname });
+        return;
+    }
+    
+    // 상대방에게 요청 전달
+    io.to(opponent.socketId).emit('incomingManualRequest', { 
+        fromNickname: requesterNickname,
+        type: 'manual' 
+    });
+  });
+  
+  // 3-2. (상대방)이 요청에 응답 (수락/거절)
   socket.on('respondToRequest', (data) => {
-    const myNickname = socketIdToNickname[socket.id];
+    const responderNickname = socketIdToNickname[socket.id];
     const requesterNickname = data.requesterNickname;
     const requester = players[requesterNickname];
     
-    if (!requester) return;
+    if (!responderNickname || !requester) return;
 
     if (data.accepted) {
-        startBattle(requesterNickname, myNickname);
+        // 수락했다면, 요청자에게 "상대가 수락했으니 최종 확인해달라"고 알림
+        io.to(requester.socketId).emit('opponentAccepted', {
+            fromNickname: responderNickname,
+            type: data.isAutoMatch ? 'auto' : 'manual',
+            opponentAcceptedAt: new Date().toISOString() // 수락 시각을 함께 보냄
+        });
     } else {
-        const eventName = data.isAutoMatch ? 'autoMatchRequestDeclined' : 'manualRequestDeclined';
-        io.to(requester.socketId).emit(eventName, { fromNickname: myNickname });
+        // 거절했다면, 요청자에게 "상대가 거절했다"고 알림
+        io.to(requester.socketId).emit('opponentDeclined', { 
+            fromNickname: responderNickname,
+            type: data.isAutoMatch ? 'auto' : 'manual'
+        });
     }
   });
+
+  // 3-3. (요청자)가 상대방의 수락에 대해 최종 확인
+  socket.on('finalConfirmRequest', (data) => {
+      const requesterNickname = socketIdToNickname[socket.id];
+      const opponentNickname = data.opponentNickname;
+      const opponent = players[opponentNickname];
+
+      if(!requesterNickname || !opponent) return;
+
+      if (data.confirmed) {
+          // 최종 수락 시, 양쪽 모두에게 매치 성사 알림
+          startBattle(requesterNickname, opponentNickname);
+      } else {
+          // 요청자가 최종 거절 시, 상대방에게도 거절 알림
+          io.to(opponent.socketId).emit('opponentDeclined', {
+              fromNickname: requesterNickname,
+              type: 'manual' // 최종 단계는 항상 manual 타입으로 간주
+          });
+      }
+  });
+
 
   // --- 4. 게임방(Battle Room) 관련 로직 ---
   socket.on('joinRoom', (battleId) => {
@@ -137,9 +175,23 @@ io.on('connection', (socket) => {
     socket.to(data.battleId).emit('incomingAttack', data.attackData);
   });
 
-  socket.on('setAwayStatus', (data) => {
-    socket.to(data.battleId).emit('opponentAwayStatus', { isAway: data.isAway });
+  // AFK (자리비움) 상태 처리
+  socket.on('setAwayStatus', (isAway) => {
+      const nickname = socketIdToNickname[socket.id];
+      if (players[nickname]) {
+          players[nickname].isAway = isAway;
+          // AFK 상태가 되면 대결 준비 상태를 모두 해제
+          if (isAway) {
+              players[nickname].isReady = false;
+              players[nickname].isAutoReady = false;
+          }
+          broadcastLobbyUpdate();
+
+          // 만약 내가 AFK 상태가 되면서 진행 중이던 요청이 있었다면, 상대방에게 알려줌
+          // (이 로직은 복잡하므로 우선순위를 낮춤. 현재는 연결 끊김으로 처리)
+      }
   });
+  
 
   socket.on('reportKO', (data) => {
       const battle = gameRooms[data.battleId];
@@ -186,7 +238,6 @@ io.on('connection', (socket) => {
       if (requester) {
           if (data.accepted) {
               io.to(requester.socketId).emit('rematchAccepted');
-              // 양쪽 모두 준비 상태를 초기화하고 재대결 시작
               battle.rematchReadyStates = { [requester.nickname]: false, [responder.nickname]: false };
               io.to(data.battleId).emit('startRematch');
           } else {
@@ -201,30 +252,19 @@ io.on('connection', (socket) => {
     console.log(`[Disconnection] A user disconnected: ${socket.id}`);
     const nickname = socketIdToNickname[socket.id];
     if (nickname) {
-        // 게임 중이던 방 찾기
         const battleId = Object.keys(gameRooms).find(id => gameRooms[id].players.some(p => p.nickname === nickname));
         if (battleId) {
             io.to(battleId).emit('opponentLeft');
             delete gameRooms[battleId];
         }
-
         delete players[nickname];
         delete socketIdToNickname[socket.id];
-        broadcastLobbyUpdate(); // 로비에 있는 유저들에게 변경사항 알림
+        broadcastLobbyUpdate();
     }
   });
 });
 
 // --- 헬퍼 함수들 ---
-
-function handleRequest(socket, opponentNickname, isAutoMatch) {
-  const requesterNickname = socketIdToNickname[socket.id];
-  const opponent = players[opponentNickname];
-  if (!opponent || !requesterNickname) return;
-
-  const eventName = isAutoMatch ? 'incomingAutoMatchRequest' : 'incomingManualRequest';
-  io.to(opponent.socketId).emit(eventName, { fromNickname: requesterNickname });
-}
 
 function handlePlayerReady(socket, battleId, readyStateType) {
     const battle = gameRooms[battleId];
@@ -264,7 +304,6 @@ function startBattle(player1Nickname, player2Nickname) {
             {nickname: player1.nickname, socketId: player1.socketId},
             {nickname: player2.nickname, socketId: player2.socketId}
         ],
-        rematchState: { [player1.nickname]: 'none', [player2.nickname]: 'none' },
         outCounts: { [player1.nickname]: 0, [player2.nickname]: 0 },
         readyStates: { [player1.nickname]: false, [player2.nickname]: false },
     };
@@ -273,12 +312,12 @@ function startBattle(player1Nickname, player2Nickname) {
 
     io.to(player1.socketId).emit('matchFound', { 
         battleId: battleId, 
-        opponent: { nickname: player2.nickname, country: player2.country },
+        opponent: { nickname: player2.nickname, country: player2.country, advenLv: player2.advenLv },
         isPlayer1: true
     });
     io.to(player2.socketId).emit('matchFound', { 
         battleId: battleId, 
-        opponent: { nickname: player1.nickname, country: player1.country },
+        opponent: { nickname: player1.nickname, country: player1.country, advenLv: player1.advenLv },
         isPlayer1: false
     });
     
@@ -288,3 +327,4 @@ function startBattle(player1Nickname, player2Nickname) {
 server.listen(PORT, () => {
   console.log(`✅ Server is running on port ${PORT}`);
 });
+
