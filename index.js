@@ -60,8 +60,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('leaveLobby', () => {
-    socket.leave('lobby');
-    console.log(`[Leave Lobby] ${socketIdToNickname[socket.id]} left the lobby for a match.`);
+    const nickname = socketIdToNickname[socket.id];
+    if (players[nickname]) {
+      socket.leave('lobby');
+      console.log(`[Leave Lobby] ${nickname} left the lobby.`);
+    }
   });
 
   socket.on('toggleReady', (isReady) => {
