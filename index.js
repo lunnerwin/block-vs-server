@@ -33,7 +33,8 @@ io.on('connection', (socket) => {
     if (players[nickname] && players[nickname].socketId !== socket.id) {
       const oldSocketId = players[nickname].socketId;
       console.log(`[Duplicate] Disconnecting old session for ${nickname}`);
-      io.to(oldSocketId).emit('force_logout', { event: 'force_logout', data: {}});
+      // [수정] 데이터만 전송하도록 변경
+      io.to(oldSocketId).emit('force_logout', {});
       io.sockets.sockets.get(oldSocketId)?.disconnect();
     }
     
@@ -63,10 +64,10 @@ io.on('connection', (socket) => {
     };
     console.log(`[Lobby] ${nickname} entered.`);
     
-    // 🔥 [버그 수정] 새로운 유저에게 먼저 로비 정보를 보낸 후, 다른 사람들에게 브로드캐스트합니다.
     const lobbyPlayers = getLobbyPlayersList();
-    socket.emit('lobby_update', { event: 'lobby_update', data: lobbyPlayers }); // 나에게 먼저 전송
-    socket.broadcast.to('lobby').emit('lobby_update', { event: 'lobby_update', data: lobbyPlayers }); // 다른 사람들에게 전송
+    // [수정] 데이터만 전송하도록 변경
+    socket.emit('lobby_update', lobbyPlayers);
+    socket.broadcast.to('lobby').emit('lobby_update', lobbyPlayers);
   });
   
   socket.on('leaveLobby', () => {
@@ -123,7 +124,8 @@ io.on('connection', (socket) => {
     const target = players[targetNick];
 
     if (!requesterNick || !target || target.isAway || target.inBattle) {
-      socket.emit('request_cancelled', { event: 'request_cancelled', data: { from: targetNick } });
+      // [수정] 데이터만 전송하도록 변경
+      socket.emit('request_cancelled', { from: targetNick });
       return;
     }
 
@@ -135,7 +137,8 @@ io.on('connection', (socket) => {
         type: data.type
     };
     
-    io.to(target.socketId).emit('incoming_request', { event: 'incoming_request', data: { from: requesterNick, type: data.type, requestId: requestId }});
+    // [수정] 데이터만 전송하도록 변경
+    io.to(target.socketId).emit('incoming_request', { from: requesterNick, type: data.type, requestId: requestId });
   });
 
   socket.on('respondToRequest', (data) => {
@@ -146,9 +149,11 @@ io.on('connection', (socket) => {
     if (!requester) return;
 
     if (data.accepted) {
-        io.to(requester.socketId).emit('opponent_accepted', { event: 'opponent_accepted', data: { from: responderNick, type: 'manual' }});
+        // [수정] 데이터만 전송하도록 변경
+        io.to(requester.socketId).emit('opponent_accepted', { from: responderNick, type: 'manual' });
     } else {
-        io.to(requester.socketId).emit('opponent_declined', { event: 'opponent_declined', data: { from: responderNick, type: 'manual' }});
+        // [수정] 데이터만 전송하도록 변경
+        io.to(requester.socketId).emit('opponent_declined', { from: responderNick, type: 'manual' });
     }
   });
 
@@ -162,7 +167,8 @@ io.on('connection', (socket) => {
       if (data.confirmed) {
           startBattle(requesterNick, responderNick);
       } else {
-          io.to(responder.socketId).emit('opponent_declined', { event: 'opponent_declined', data: { from: requesterNick, type: 'manual' }});
+          // [수정] 데이터만 전송하도록 변경
+          io.to(responder.socketId).emit('opponent_declined', { from: requesterNick, type: 'manual' });
       }
   });
 
@@ -178,7 +184,8 @@ io.on('connection', (socket) => {
                  const otherPlayerNick = request.from === nickname ? request.to : request.from;
                  const otherPlayer = players[otherPlayerNick];
                  if(otherPlayer) {
-                    io.to(otherPlayer.socketId).emit('request_cancelled', { event: 'request_cancelled', data: { from: nickname } });
+                    // [수정] 데이터만 전송하도록 변경
+                    io.to(otherPlayer.socketId).emit('request_cancelled', { from: nickname });
                  }
                  delete pendingRequests[id];
             }
@@ -226,7 +233,8 @@ function getLobbyPlayersList() {
 
 function broadcastLobbyUpdate() {
   const lobbyPlayers = getLobbyPlayersList();
-  io.to('lobby').emit('lobby_update', { event: 'lobby_update', data: lobbyPlayers });
+  // [수정] 데이터만 전송하도록 변경
+  io.to('lobby').emit('lobby_update', lobbyPlayers);
 }
 
 function startBattle(player1Nick, player2Nick) {
@@ -243,13 +251,11 @@ function startBattle(player1Nick, player2Nick) {
 
     console.log(`[Battle] Match found: ${player1Nick} vs ${player2Nick}. ID: ${battleId}`);
     
+    // [수정] 데이터만 전송하도록 변경
     const matchData = {
-        event: 'match_found',
-        data: {
-            battleId: battleId,
-            player1: player1Nick,
-            player2: player2Nick,
-        }
+        battleId: battleId,
+        player1: player1Nick,
+        player2: player2Nick,
     };
 
     io.to(player1.socketId).to(player2.socketId).emit('match_found', matchData);
@@ -279,4 +285,3 @@ function processAutoMatchQueue() {
 server.listen(PORT, () => {
   console.log(`✅ Server is running on http://localhost:${PORT}`);
 });
-
